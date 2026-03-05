@@ -86,20 +86,20 @@ function parseSlides(topic, voiceover) {
 }
 
 function ffmpegSlide(png, clip, dur) {
-  // Try libx264 first; fall back to mpeg4 if encoder unavailable
+  // Try codecs in order; success = output file exists with size > 0
   const base = `ffmpeg -y -loop 1 -i "${png}" -t ${dur} -pix_fmt yuv420p -r 25`;
   const codecs = ['libx264', 'mpeg4', 'libx265'];
+  const errors = [];
   for (const codec of codecs) {
     try {
+      if (fs.existsSync(clip)) fs.unlinkSync(clip);
       execSync(`${base} -c:v ${codec} "${clip}"`, { timeout: 60000, stdio: 'pipe' });
-      return codec;
     } catch(e) {
-      const msg = (e.stderr || '').toString();
-      if (msg.includes('Unknown encoder') || msg.includes('Encoder') || msg.includes('not found') || msg.includes('Invalid option')) continue;
-      throw new Error(`ffmpeg(${codec}) failed: ${msg.slice(0,400)}`);
+      errors.push(`${codec}: ${(e.stderr||'').toString().slice(0,120)}`);
     }
+    if (fs.existsSync(clip) && fs.statSync(clip).size > 1000) return codec;
   }
-  throw new Error('No working video codec found (tried libx264, mpeg4, libx265)');
+  throw new Error('No codec produced output. Errors: ' + errors.join(' | '));
 }
 
 async function main() {
