@@ -13,6 +13,18 @@ if (fs.existsSync(WORK)) {
   fs.mkdirSync(WORK, { recursive: true });
 }
 
+// Try to install system ffmpeg via Alpine apk (works if container runs as root)
+try {
+  const r = spawnSync('apk', ['add', '--no-cache', 'ffmpeg'], { timeout: 90000, stdio: 'pipe', encoding: 'utf8' });
+  if (r.status === 0) {
+    console.log('apk: ffmpeg installed successfully');
+  } else {
+    console.log('apk: ffmpeg install failed (status ' + r.status + '), stderr:', (r.stderr||'').slice(0,200));
+  }
+} catch(e) {
+  console.log('apk not available:', e.message.slice(0,100));
+}
+
 // Probe available ffmpeg binaries
 function probeFfmpeg() {
   const candidates = [
@@ -38,9 +50,18 @@ const FFWASM_DIR = '/tmp/ffwasm';
 async function ensureWasmFfmpeg() {
   if (!fs.existsSync(FFWASM_DIR + '/node_modules/@ffmpeg/ffmpeg')) {
     console.log('Installing @ffmpeg/ffmpeg...');
-    execSync(`npm install @ffmpeg/ffmpeg@0.12.6 @ffmpeg/core@0.12.4 --prefix ${FFWASM_DIR} --no-fund --no-audit`, { timeout: 180000 });
+    execSync(`npm install @ffmpeg/ffmpeg@0.12.6 @ffmpeg/core@0.12.4 --prefix ${FFWASM_DIR} --no-fund --no-audit`, { timeout: 300000 });
     console.log('@ffmpeg/ffmpeg installed');
+  } else {
+    console.log('@ffmpeg/ffmpeg already present');
   }
+  // Verify core WASM exists
+  const corePath = FFWASM_DIR + '/node_modules/@ffmpeg/core/dist/ffmpeg-core.js';
+  if (!fs.existsSync(corePath)) {
+    console.log('Core missing, reinstalling...');
+    execSync(`npm install @ffmpeg/ffmpeg@0.12.6 @ffmpeg/core@0.12.4 --prefix ${FFWASM_DIR} --no-fund --no-audit`, { timeout: 300000 });
+  }
+  console.log('Core exists:', fs.existsSync(corePath));
 }
 
 const sharp = require('/tmp/nmods/node_modules/sharp');
@@ -114,33 +135,40 @@ function parseSlides(topic, voiceover) {
   return slides;
 }
 
-// Run ffmpeg via wasm in a child script
+// Run ffmpeg via WASM in a child script — with explicit corePath for Node.js
 async function encodeWithWasm(pngs, durations, audioFile, outputMp4) {
+  const corePath = FFWASM_DIR + '/node_modules/@ffmpeg/core/dist/ffmpeg-core.js';
   const script = `
 const { createFFmpeg, fetchFile } = require('${FFWASM_DIR}/node_modules/@ffmpeg/ffmpeg');
 const fs = require('fs');
 
 (async () => {
-  const ffmpeg = createFFmpeg({ log: false });
+  console.log('Loading ffmpeg WASM with corePath...');
+  const ffmpeg = createFFmpeg({
+    log: true,
+    corePath: 'file://${corePath}'
+  });
   await ffmpeg.load();
+  console.log('WASM loaded OK');
 
-  // Write each PNG
+  // Write each PNG directly from disk
   const pngs = ${JSON.stringify(pngs)};
   const durations = ${JSON.stringify(durations)};
   for (let i = 0; i < pngs.length; i++) {
-    ffmpeg.FS('writeFile', 'slide_' + String(i).padStart(3,'0') + '.png', await fetchFile(pngs[i]));
+    const name = 'slide_' + String(i).padStart(3,'0') + '.png';
+    ffmpeg.FS('writeFile', name, new Uint8Array(fs.readFileSync(pngs[i])));
   }
 
   // Write audio
   const audioExt = '${path.extname(audioFile)}';
-  ffmpeg.FS('writeFile', 'audio' + audioExt, await fetchFile('${audioFile}'));
+  ffmpeg.FS('writeFile', 'audio' + audioExt, new Uint8Array(fs.readFileSync('${audioFile}')));
 
-  // Create concat list: each slide repeated at 25fps
+  // Encode each slide to a clip
   const clips = [];
   for (let i = 0; i < pngs.length; i++) {
     const clipName = 'clip_' + String(i).padStart(3,'0') + '.mp4';
     await ffmpeg.run('-loop', '1', '-i', 'slide_' + String(i).padStart(3,'0') + '.png',
-      '-t', String(durations[i].toFixed(2)), '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p', '-r', '25', '-y', clipName);
+      '-t', String(durations[i].toFixed(2)), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '25', '-y', clipName);
     clips.push(clipName);
     console.log('Encoded slide', i);
   }
@@ -158,12 +186,19 @@ const fs = require('fs');
   const data = ffmpeg.FS('readFile', 'output.mp4');
   fs.writeFileSync('${outputMp4}', Buffer.from(data));
   console.log('DONE size:', data.byteLength);
-})().catch(e => { console.error('WASM error:', e.message); process.exit(1); });
+})().catch(e => { console.error('WASM error:', e.message, e.stack ? e.stack.slice(0,500) : ''); process.exit(1); });
 `;
   const scriptPath = '/tmp/wasm_encode.js';
   fs.writeFileSync(scriptPath, script);
-  const out = execSync('node ' + scriptPath, { timeout: 3600000, encoding: 'utf8', stdio: 'pipe' });
-  console.log('WASM output:', out.slice(0, 200));
+  let out = '';
+  try {
+    out = execSync('node ' + scriptPath, { timeout: 3600000, encoding: 'utf8', stdio: 'pipe' });
+    console.log('WASM output:', out.slice(0, 500));
+  } catch(e) {
+    const stderr = (e.stderr || '').slice(0, 2000);
+    const stdout = (e.stdout || '').slice(0, 1000);
+    throw new Error('wasm_encode failed|STDERR:' + stderr + '|STDOUT:' + stdout);
+  }
 }
 
 async function main() {
@@ -189,7 +224,7 @@ async function main() {
       const idx = String(i).padStart(3,'0');
       const clip = `${WORK}/clip_${idx}.mp4`;
       const r = spawnSync(FFMPEG, ['-y','-loop','1','-i',pngs[i],'-t',durations[i].toFixed(2),
-        '-c:v','mpeg4','-pix_fmt','yuv420p','-r','25', clip],
+        '-c:v','libx264','-pix_fmt','yuv420p','-r','25', clip],
         { timeout: 60000, encoding: 'utf8' });
       if (!fs.existsSync(clip) || fs.statSync(clip).size < 100) {
         throw new Error(`ffmpeg clip failed for slide ${i}: ${(r.stderr||'').slice(0,300)}`);
