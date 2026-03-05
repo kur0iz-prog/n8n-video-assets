@@ -42,10 +42,34 @@ function probeFfmpeg() {
   return null;
 }
 
-const FFMPEG = probeFfmpeg();
-console.log('usable ffmpeg:', FFMPEG);
+// Install @ffmpeg-installer/ffmpeg — statically linked, works on Alpine/musl
+const FFNPM_DIR = '/tmp/ffnpm';
+async function ensureNpmFfmpeg() {
+  try {
+    if (!fs.existsSync(FFNPM_DIR + '/node_modules/@ffmpeg-installer/ffmpeg')) {
+      console.log('Installing @ffmpeg-installer/ffmpeg...');
+      execSync(
+        `npm install @ffmpeg-installer/ffmpeg --prefix ${FFNPM_DIR} --no-fund --no-audit`,
+        { timeout: 180000, encoding: 'utf8' }
+      );
+      console.log('@ffmpeg-installer/ffmpeg installed');
+    } else {
+      console.log('@ffmpeg-installer/ffmpeg already present');
+    }
+    const installer = require(FFNPM_DIR + '/node_modules/@ffmpeg-installer/ffmpeg');
+    const binPath = installer.path;
+    console.log('@ffmpeg-installer path:', binPath);
+    try { fs.chmodSync(binPath, 0o755); } catch(e) {}
+    const r = spawnSync(binPath, ['-version'], { encoding: 'utf8', timeout: 10000 });
+    console.log('@ffmpeg-installer probe exit:', r.status, (r.stderr||'').slice(0,120));
+    if (r.status === 0) return binPath;
+  } catch(e) {
+    console.log('@ffmpeg-installer failed:', e.message.slice(0,200));
+  }
+  return null;
+}
 
-// Install @ffmpeg/ffmpeg + @ffmpeg/core if system ffmpeg is broken
+// Install @ffmpeg/ffmpeg + @ffmpeg/core if all else fails
 const FFWASM_DIR = '/tmp/ffwasm';
 async function ensureWasmFfmpeg() {
   if (!fs.existsSync(FFWASM_DIR + '/node_modules/@ffmpeg/ffmpeg')) {
@@ -55,7 +79,6 @@ async function ensureWasmFfmpeg() {
   } else {
     console.log('@ffmpeg/ffmpeg already present');
   }
-  // Verify core WASM exists
   const corePath = FFWASM_DIR + '/node_modules/@ffmpeg/core/dist/ffmpeg-core.js';
   if (!fs.existsSync(corePath)) {
     console.log('Core missing, reinstalling...');
@@ -135,64 +158,102 @@ function parseSlides(topic, voiceover) {
   return slides;
 }
 
-// Run ffmpeg via WASM in a child script — with explicit corePath for Node.js
-async function encodeWithWasm(pngs, durations, audioFile, outputMp4) {
-  const corePath = FFWASM_DIR + '/node_modules/@ffmpeg/core/dist/ffmpeg-core.js';
-  const script = `
-const { createFFmpeg, fetchFile } = require('${FFWASM_DIR}/node_modules/@ffmpeg/ffmpeg');
-const fs = require('fs');
-
-(async () => {
-  console.log('Loading ffmpeg WASM with corePath...');
-  const ffmpeg = createFFmpeg({
-    log: true,
-    corePath: 'file://${corePath}'
-  });
-  await ffmpeg.load();
-  console.log('WASM loaded OK');
-
-  // Write each PNG directly from disk
-  const pngs = ${JSON.stringify(pngs)};
-  const durations = ${JSON.stringify(durations)};
-  for (let i = 0; i < pngs.length; i++) {
-    const name = 'slide_' + String(i).padStart(3,'0') + '.png';
-    ffmpeg.FS('writeFile', name, new Uint8Array(fs.readFileSync(pngs[i])));
-  }
-
-  // Write audio
-  const audioExt = '${path.extname(audioFile)}';
-  ffmpeg.FS('writeFile', 'audio' + audioExt, new Uint8Array(fs.readFileSync('${audioFile}')));
-
-  // Encode each slide to a clip
+// Encode using any available ffmpeg binary
+function encodeWithBin(FFMPEG, pngs, durations, audioFile, outputMp4) {
   const clips = [];
   for (let i = 0; i < pngs.length; i++) {
-    const clipName = 'clip_' + String(i).padStart(3,'0') + '.mp4';
-    await ffmpeg.run('-loop', '1', '-i', 'slide_' + String(i).padStart(3,'0') + '.png',
-      '-t', String(durations[i].toFixed(2)), '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-r', '25', '-y', clipName);
-    clips.push(clipName);
-    console.log('Encoded slide', i);
+    const idx = String(i).padStart(3,'0');
+    const clip = `${WORK}/clip_${idx}.mp4`;
+    const r = spawnSync(FFMPEG, ['-y','-loop','1','-i',pngs[i],'-t',durations[i].toFixed(2),
+      '-c:v','libx264','-pix_fmt','yuv420p','-r','25', clip],
+      { timeout: 60000, encoding: 'utf8' });
+    if (!fs.existsSync(clip) || fs.statSync(clip).size < 100) {
+      throw new Error(`ffmpeg clip failed for slide ${i}|${(r.stderr||'').slice(0,300)}`);
+    }
+    clips.push(clip);
+    console.log(`Slide ${idx} OK`);
   }
+  const concatTxt = `${WORK}/concat.txt`;
+  fs.writeFileSync(concatTxt, clips.map(p => `file '${p}'`).join('\n'));
+  const silent = `${WORK}/silent.mp4`;
+  const rc = spawnSync(FFMPEG, ['-f','concat','-safe','0','-i',concatTxt,'-c','copy','-y',silent], { timeout: 120000 });
+  if (!fs.existsSync(silent) || fs.statSync(silent).size < 100) {
+    throw new Error(`concat failed|${(rc.stderr||'').slice(0,300)}`);
+  }
+  const outDir = path.dirname(outputMp4);
+  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+  const rm = spawnSync(FFMPEG, ['-i',silent,'-i',audioFile,'-c:v','copy','-c:a','aac',
+    '-map','0:v:0','-map','1:a:0','-shortest','-y',outputMp4], { timeout: 300000 });
+  if (!fs.existsSync(outputMp4) || fs.statSync(outputMp4).size < 1000) {
+    throw new Error(`audio merge failed|${(rm.stderr||'').slice(0,300)}`);
+  }
+}
 
-  // Concat
-  const concatList = clips.map(c => 'file ' + c).join('\\n');
-  ffmpeg.FS('writeFile', 'concat.txt', new TextEncoder().encode(concatList));
-  await ffmpeg.run('-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', '-y', 'silent.mp4');
+// Run ffmpeg via WASM in a child script (last resort)
+async function encodeWithWasm(pngs, durations, audioFile, outputMp4) {
+  const corePath = FFWASM_DIR + '/node_modules/@ffmpeg/core/dist/ffmpeg-core.js';
+  // Serve core via tiny http to avoid file:// URL issues in Node.js fetch
+  const script = `
+const { createFFmpeg } = require('${FFWASM_DIR}/node_modules/@ffmpeg/ffmpeg');
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
 
-  // Merge audio
-  await ffmpeg.run('-i', 'silent.mp4', '-i', 'audio' + audioExt,
-    '-c:v', 'copy', '-c:a', 'aac', '-map', '0:v:0', '-map', '1:a:0', '-shortest', '-y', 'output.mp4');
+// Serve WASM files locally so fetch() can load them
+const coreDir = path.dirname('${corePath}');
+const server = http.createServer((req, res) => {
+  const fp = coreDir + req.url.split('?')[0];
+  if (fs.existsSync(fp)) {
+    const ct = fp.endsWith('.wasm') ? 'application/wasm' : 'application/javascript';
+    res.writeHead(200, {'Content-Type': ct});
+    fs.createReadStream(fp).pipe(res);
+  } else { res.writeHead(404); res.end(); }
+});
+server.listen(0, '127.0.0.1', async () => {
+  const port = server.address().port;
+  console.log('WASM server on port', port);
+  try {
+    const ffmpeg = createFFmpeg({
+      log: true,
+      corePath: 'http://127.0.0.1:' + port + '/ffmpeg-core.js'
+    });
+    await ffmpeg.load();
+    console.log('WASM loaded OK');
 
-  // Save output
-  const data = ffmpeg.FS('readFile', 'output.mp4');
-  fs.writeFileSync('${outputMp4}', Buffer.from(data));
-  console.log('DONE size:', data.byteLength);
-})().catch(e => { console.error('WASM error:', e.message, e.stack ? e.stack.slice(0,500) : ''); process.exit(1); });
+    const pngs = ${JSON.stringify(pngs)};
+    const durations = ${JSON.stringify(durations)};
+    for (let i = 0; i < pngs.length; i++) {
+      const name = 'slide_' + String(i).padStart(3,'0') + '.png';
+      ffmpeg.FS('writeFile', name, new Uint8Array(fs.readFileSync(pngs[i])));
+    }
+    const audioExt = '${path.extname(audioFile)}';
+    ffmpeg.FS('writeFile', 'audio' + audioExt, new Uint8Array(fs.readFileSync('${audioFile}')));
+
+    const clips = [];
+    for (let i = 0; i < pngs.length; i++) {
+      const clipName = 'clip_' + String(i).padStart(3,'0') + '.mp4';
+      await ffmpeg.run('-loop','1','-i','slide_'+String(i).padStart(3,'0')+'.png',
+        '-t',String(durations[i].toFixed(2)),'-c:v','libx264','-pix_fmt','yuv420p','-r','25','-y',clipName);
+      clips.push(clipName);
+    }
+    const concatList = clips.map(c => 'file ' + c).join('\\n');
+    ffmpeg.FS('writeFile', 'concat.txt', new TextEncoder().encode(concatList));
+    await ffmpeg.run('-f','concat','-safe','0','-i','concat.txt','-c','copy','-y','silent.mp4');
+    await ffmpeg.run('-i','silent.mp4','-i','audio'+audioExt,
+      '-c:v','copy','-c:a','aac','-map','0:v:0','-map','1:a:0','-shortest','-y','output.mp4');
+    const data = ffmpeg.FS('readFile','output.mp4');
+    fs.writeFileSync('${outputMp4}', Buffer.from(data));
+    console.log('DONE size:', data.byteLength);
+  } catch(e) {
+    console.error('WASM error:', e.message);
+    process.exit(1);
+  } finally { server.close(); }
+});
 `;
   const scriptPath = '/tmp/wasm_encode.js';
   fs.writeFileSync(scriptPath, script);
-  let out = '';
   try {
-    out = execSync('node ' + scriptPath, { timeout: 3600000, encoding: 'utf8', stdio: 'pipe' });
+    const out = execSync('node ' + scriptPath, { timeout: 3600000, encoding: 'utf8', stdio: 'pipe' });
     console.log('WASM output:', out.slice(0, 500));
   } catch(e) {
     const stderr = (e.stderr || '').slice(0, 2000);
@@ -216,33 +277,22 @@ async function main() {
     console.log(`PNG ${idx}: ${fs.statSync(png).size} bytes`);
   }
 
-  if (FFMPEG) {
-    // System ffmpeg works — use it
-    console.log('Using system ffmpeg:', FFMPEG);
-    const clips = [];
-    for (let i = 0; i < pngs.length; i++) {
-      const idx = String(i).padStart(3,'0');
-      const clip = `${WORK}/clip_${idx}.mp4`;
-      const r = spawnSync(FFMPEG, ['-y','-loop','1','-i',pngs[i],'-t',durations[i].toFixed(2),
-        '-c:v','libx264','-pix_fmt','yuv420p','-r','25', clip],
-        { timeout: 60000, encoding: 'utf8' });
-      if (!fs.existsSync(clip) || fs.statSync(clip).size < 100) {
-        throw new Error(`ffmpeg clip failed for slide ${i}: ${(r.stderr||'').slice(0,300)}`);
-      }
-      clips.push(clip);
-      console.log(`Slide ${idx} OK`);
-    }
-    const concatTxt = `${WORK}/concat.txt`;
-    fs.writeFileSync(concatTxt, clips.map(p => `file '${p}'`).join('\n'));
-    const silent = `${WORK}/silent.mp4`;
-    spawnSync(FFMPEG, ['-f','concat','-safe','0','-i',concatTxt,'-c','copy','-y',silent], { timeout: 120000 });
+  // Try ffmpeg sources in order: system → npm static binary → WASM
+  let ffmpegBin = probeFfmpeg();
+  console.log('System ffmpeg probe:', ffmpegBin);
+
+  if (!ffmpegBin) {
+    console.log('System ffmpeg not usable, trying @ffmpeg-installer/ffmpeg...');
+    ffmpegBin = await ensureNpmFfmpeg();
+  }
+
+  if (ffmpegBin) {
+    console.log('Encoding with binary:', ffmpegBin);
     const outDir = path.dirname(output_mp4);
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-    spawnSync(FFMPEG, ['-i',silent,'-i',audio_file,'-c:v','copy','-c:a','aac',
-      '-map','0:v:0','-map','1:a:0','-shortest','-y',output_mp4], { timeout: 300000 });
+    encodeWithBin(ffmpegBin, pngs, durations, audio_file, output_mp4);
   } else {
-    // System ffmpeg broken — use @ffmpeg/ffmpeg WASM
-    console.log('System ffmpeg broken, using WASM...');
+    console.log('All binary ffmpeg options failed, using WASM...');
     await ensureWasmFfmpeg();
     const outDir = path.dirname(output_mp4);
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
