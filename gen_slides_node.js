@@ -85,6 +85,23 @@ function parseSlides(topic, voiceover) {
   return slides;
 }
 
+function ffmpegSlide(png, clip, dur) {
+  // Try libx264 first; fall back to mpeg4 if encoder unavailable
+  const base = `ffmpeg -y -loop 1 -i "${png}" -t ${dur} -pix_fmt yuv420p -r 25`;
+  const codecs = ['libx264', 'mpeg4', 'libx265'];
+  for (const codec of codecs) {
+    try {
+      execSync(`${base} -c:v ${codec} "${clip}"`, { timeout: 60000, stdio: 'pipe' });
+      return codec;
+    } catch(e) {
+      const msg = (e.stderr || '').toString();
+      if (msg.includes('Unknown encoder') || msg.includes('Encoder') || msg.includes('not found') || msg.includes('Invalid option')) continue;
+      throw new Error(`ffmpeg(${codec}) failed: ${msg.slice(0,400)}`);
+    }
+  }
+  throw new Error('No working video codec found (tried libx264, mpeg4, libx265)');
+}
+
 async function main() {
   const slides = parseSlides(topic, voiceover);
   const clips = [];
@@ -93,9 +110,9 @@ async function main() {
     const png = `${WORK}/slide_${idx}.png`;
     const clip = `${WORK}/clip_${idx}.mp4`;
     await sharp(Buffer.from(slides[i].svg)).resize(1920,1080).png().toFile(png);
-    execSync(`ffmpeg -loop 1 -i "${png}" -t ${slides[i].duration.toFixed(2)} -c:v libx264 -pix_fmt yuv420p -r 25 -y "${clip}"`, { timeout: 30000 });
+    const codec = ffmpegSlide(png, clip, slides[i].duration.toFixed(2));
     clips.push(clip);
-    console.log(`Slide ${idx} OK`);
+    console.log(`Slide ${idx} OK (${codec})`);
   }
   const concatTxt = `${WORK}/concat.txt`;
   fs.writeFileSync(concatTxt, clips.map(p => `file '${p}'`).join('\n'));
