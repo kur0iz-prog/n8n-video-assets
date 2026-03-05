@@ -7,7 +7,32 @@ const params = JSON.parse(fs.readFileSync('/tmp/slide_params.json', 'utf8'));
 const { audio_file, topic, voiceover, channel, output_mp4 } = params;
 
 const WORK = '/tmp/slides_work';
-if (!fs.existsSync(WORK)) fs.mkdirSync(WORK, { recursive: true });
+if (fs.existsSync(WORK)) {
+  // Clean up from previous runs
+  fs.readdirSync(WORK).forEach(f => { try { fs.unlinkSync(WORK+'/'+f); } catch(e){} });
+} else {
+  fs.mkdirSync(WORK, { recursive: true });
+}
+
+// ---- Diagnostics ----
+try {
+  const ver = execSync('ffmpeg -version 2>&1', { encoding: 'utf8', timeout: 10000 }).split('\n')[0];
+  console.log('ffmpeg:', ver);
+} catch(e) {
+  console.log('ffmpeg -version error:', e.message);
+}
+
+// Quick smoke test - can ffmpeg write an MP4 at all?
+try {
+  execSync('ffmpeg -y -f lavfi -i color=c=blue:s=320x240:r=5 -t 1 /tmp/smoke.mp4', { encoding: 'utf8', timeout: 30000, stdio: 'pipe' });
+  const sz = fs.existsSync('/tmp/smoke.mp4') ? fs.statSync('/tmp/smoke.mp4').size : 0;
+  console.log('smoke test mp4 size:', sz);
+} catch(e) {
+  const se = (e.stderr||'').toString().slice(0,500);
+  const so = (e.stdout||'').toString().slice(0,200);
+  console.log('smoke test FAILED. stderr:', se, '| stdout:', so);
+}
+// ---- End Diagnostics ----
 
 const sharp = require('/tmp/nmods/node_modules/sharp');
 
@@ -86,7 +111,10 @@ function parseSlides(topic, voiceover) {
 }
 
 function ffmpegSlide(png, clip, dur) {
-  // Try codecs in order; success = output file exists with size > 0
+  const pngSize = fs.existsSync(png) ? fs.statSync(png).size : -1;
+  console.log(`  PNG ${path.basename(png)}: ${pngSize} bytes`);
+  if (pngSize < 100) throw new Error('PNG missing or too small: ' + png);
+
   const base = `ffmpeg -y -loop 1 -i "${png}" -t ${dur} -pix_fmt yuv420p -r 25`;
   const codecs = ['libx264', 'mpeg4', 'libx265'];
   const errors = [];
@@ -95,11 +123,14 @@ function ffmpegSlide(png, clip, dur) {
       if (fs.existsSync(clip)) fs.unlinkSync(clip);
       execSync(`${base} -c:v ${codec} "${clip}"`, { timeout: 60000, stdio: 'pipe' });
     } catch(e) {
-      errors.push(`${codec}: ${(e.stderr||'').toString().slice(0,120)}`);
+      const se = (e.stderr||'').toString().slice(0,500);
+      errors.push(`${codec}: ${se}`);
     }
-    if (fs.existsSync(clip) && fs.statSync(clip).size > 1000) return codec;
+    const clipSize = fs.existsSync(clip) ? fs.statSync(clip).size : 0;
+    console.log(`  ${codec} clip size: ${clipSize}`);
+    if (clipSize > 1000) return codec;
   }
-  throw new Error('No codec produced output. Errors: ' + errors.join(' | '));
+  throw new Error('No codec produced output.\n' + errors.map(e => e.slice(0,300)).join('\n---\n'));
 }
 
 async function main() {
