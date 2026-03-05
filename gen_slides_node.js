@@ -1,5 +1,5 @@
 'use strict';
-const { execSync } = require('child_process');
+const { execSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -8,38 +8,46 @@ const { audio_file, topic, voiceover, channel, output_mp4 } = params;
 
 const WORK = '/tmp/slides_work';
 if (fs.existsSync(WORK)) {
-  // Clean up from previous runs
   fs.readdirSync(WORK).forEach(f => { try { fs.unlinkSync(WORK+'/'+f); } catch(e){} });
 } else {
   fs.mkdirSync(WORK, { recursive: true });
 }
 
-// ---- Diagnostics ----
-try {
-  const ver = execSync('ffmpeg -version 2>&1', { encoding: 'utf8', timeout: 10000 }).split('\n')[0];
-  console.log('ffmpeg:', ver);
-} catch(e) {
-  console.log('ffmpeg -version error:', e.message);
+// Probe available ffmpeg binaries
+function probeFfmpeg() {
+  const candidates = [
+    '/usr/local/bin/ffmpeg',
+    '/usr/bin/ffmpeg',
+    'ffmpeg',
+  ];
+  for (const bin of candidates) {
+    try {
+      const r = spawnSync(bin, ['-version'], { encoding: 'utf8', timeout: 8000, env: process.env });
+      console.log(`${bin} exit:${r.status} stderr:${(r.stderr||'').slice(0,100)}`);
+      if (r.status === 0) return bin;
+    } catch(e) { /* skip */ }
+  }
+  return null;
 }
 
-// Quick smoke test - can ffmpeg write an MP4 at all?
-try {
-  execSync('ffmpeg -y -f lavfi -i color=c=blue:s=320x240:r=5 -t 1 /tmp/smoke.mp4', { encoding: 'utf8', timeout: 30000, stdio: 'pipe' });
-  const sz = fs.existsSync('/tmp/smoke.mp4') ? fs.statSync('/tmp/smoke.mp4').size : 0;
-  console.log('smoke test mp4 size:', sz);
-} catch(e) {
-  const se = (e.stderr||'').toString().slice(0,500);
-  const so = (e.stdout||'').toString().slice(0,200);
-  console.log('smoke test FAILED. stderr:', se, '| stdout:', so);
+const FFMPEG = probeFfmpeg();
+console.log('usable ffmpeg:', FFMPEG);
+
+// Install @ffmpeg/ffmpeg + @ffmpeg/core if system ffmpeg is broken
+const FFWASM_DIR = '/tmp/ffwasm';
+async function ensureWasmFfmpeg() {
+  if (!fs.existsSync(FFWASM_DIR + '/node_modules/@ffmpeg/ffmpeg')) {
+    console.log('Installing @ffmpeg/ffmpeg...');
+    execSync(`npm install @ffmpeg/ffmpeg@0.12.6 @ffmpeg/core@0.12.4 --prefix ${FFWASM_DIR} --no-fund --no-audit`, { timeout: 180000 });
+    console.log('@ffmpeg/ffmpeg installed');
+  }
 }
-// ---- End Diagnostics ----
 
 const sharp = require('/tmp/nmods/node_modules/sharp');
 
 function esc(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
-
 function wrapText(text, max) {
   const words = text.split(' ');
   const lines = []; let cur = '';
@@ -50,7 +58,6 @@ function wrapText(text, max) {
   if (cur) lines.push(cur);
   return lines.slice(0, 4);
 }
-
 function titleSvg(title, subtitle) {
   const lines = wrapText(title, 38);
   const lh = 110;
@@ -68,7 +75,6 @@ function titleSvg(title, subtitle) {
     <text x="960" y="${startY + lines.length * lh + 185}" font-family="sans-serif" font-size="52" fill="#a8dadc" text-anchor="middle">${esc(subtitle)}</text>
   </svg>`;
 }
-
 function contentSvg(text, slideNum) {
   const lines = wrapText(text, 46);
   const lh = 90;
@@ -85,7 +91,6 @@ function contentSvg(text, slideNum) {
     ${els}
   </svg>`;
 }
-
 function ctaSvg() {
   return `<svg width="1920" height="1080" xmlns="http://www.w3.org/2000/svg">
     <rect width="1920" height="1080" fill="#0f3460"/>
@@ -94,7 +99,6 @@ function ctaSvg() {
     <text x="960" y="620" font-family="sans-serif" font-size="54" fill="white" text-anchor="middle">More entrepreneur tips every week</text>
   </svg>`;
 }
-
 function parseSlides(topic, voiceover) {
   const slides = [];
   slides.push({ svg: titleSvg(topic, 'The complete guide'), duration: 6 });
@@ -110,49 +114,110 @@ function parseSlides(topic, voiceover) {
   return slides;
 }
 
-function ffmpegSlide(png, clip, dur) {
-  const pngSize = fs.existsSync(png) ? fs.statSync(png).size : -1;
-  console.log(`  PNG ${path.basename(png)}: ${pngSize} bytes`);
-  if (pngSize < 100) throw new Error('PNG missing or too small: ' + png);
+// Run ffmpeg via wasm in a child script
+async function encodeWithWasm(pngs, durations, audioFile, outputMp4) {
+  const script = `
+const { createFFmpeg, fetchFile } = require('${FFWASM_DIR}/node_modules/@ffmpeg/ffmpeg');
+const fs = require('fs');
 
-  const base = `ffmpeg -y -loop 1 -i "${png}" -t ${dur} -pix_fmt yuv420p -r 25`;
-  const codecs = ['libx264', 'mpeg4', 'libx265'];
-  const errors = [];
-  for (const codec of codecs) {
-    try {
-      if (fs.existsSync(clip)) fs.unlinkSync(clip);
-      execSync(`${base} -c:v ${codec} "${clip}"`, { timeout: 60000, stdio: 'pipe' });
-    } catch(e) {
-      const se = (e.stderr||'').toString().slice(0,500);
-      errors.push(`${codec}: ${se}`);
-    }
-    const clipSize = fs.existsSync(clip) ? fs.statSync(clip).size : 0;
-    console.log(`  ${codec} clip size: ${clipSize}`);
-    if (clipSize > 1000) return codec;
+(async () => {
+  const ffmpeg = createFFmpeg({ log: false });
+  await ffmpeg.load();
+
+  // Write each PNG
+  const pngs = ${JSON.stringify(pngs)};
+  const durations = ${JSON.stringify(durations)};
+  for (let i = 0; i < pngs.length; i++) {
+    ffmpeg.FS('writeFile', 'slide_' + String(i).padStart(3,'0') + '.png', await fetchFile(pngs[i]));
   }
-  throw new Error('No codec produced output.\n' + errors.map(e => e.slice(0,300)).join('\n---\n'));
+
+  // Write audio
+  const audioExt = '${path.extname(audioFile)}';
+  ffmpeg.FS('writeFile', 'audio' + audioExt, await fetchFile('${audioFile}'));
+
+  // Create concat list: each slide repeated at 25fps
+  const clips = [];
+  for (let i = 0; i < pngs.length; i++) {
+    const clipName = 'clip_' + String(i).padStart(3,'0') + '.mp4';
+    await ffmpeg.run('-loop', '1', '-i', 'slide_' + String(i).padStart(3,'0') + '.png',
+      '-t', String(durations[i].toFixed(2)), '-c:v', 'mpeg4', '-pix_fmt', 'yuv420p', '-r', '25', '-y', clipName);
+    clips.push(clipName);
+    console.log('Encoded slide', i);
+  }
+
+  // Concat
+  const concatList = clips.map(c => 'file ' + c).join('\\n');
+  ffmpeg.FS('writeFile', 'concat.txt', new TextEncoder().encode(concatList));
+  await ffmpeg.run('-f', 'concat', '-safe', '0', '-i', 'concat.txt', '-c', 'copy', '-y', 'silent.mp4');
+
+  // Merge audio
+  await ffmpeg.run('-i', 'silent.mp4', '-i', 'audio' + audioExt,
+    '-c:v', 'copy', '-c:a', 'aac', '-map', '0:v:0', '-map', '1:a:0', '-shortest', '-y', 'output.mp4');
+
+  // Save output
+  const data = ffmpeg.FS('readFile', 'output.mp4');
+  fs.writeFileSync('${outputMp4}', Buffer.from(data));
+  console.log('DONE size:', data.byteLength);
+})().catch(e => { console.error('WASM error:', e.message); process.exit(1); });
+`;
+  const scriptPath = '/tmp/wasm_encode.js';
+  fs.writeFileSync(scriptPath, script);
+  const out = execSync('node ' + scriptPath, { timeout: 3600000, encoding: 'utf8', stdio: 'pipe' });
+  console.log('WASM output:', out.slice(0, 200));
 }
 
 async function main() {
   const slides = parseSlides(topic, voiceover);
-  const clips = [];
+
+  // Generate PNGs
+  const pngs = [];
+  const durations = [];
   for (let i = 0; i < slides.length; i++) {
     const idx = String(i).padStart(3,'0');
     const png = `${WORK}/slide_${idx}.png`;
-    const clip = `${WORK}/clip_${idx}.mp4`;
     await sharp(Buffer.from(slides[i].svg)).resize(1920,1080).png().toFile(png);
-    const codec = ffmpegSlide(png, clip, slides[i].duration.toFixed(2));
-    clips.push(clip);
-    console.log(`Slide ${idx} OK (${codec})`);
+    pngs.push(png);
+    durations.push(slides[i].duration);
+    console.log(`PNG ${idx}: ${fs.statSync(png).size} bytes`);
   }
-  const concatTxt = `${WORK}/concat.txt`;
-  fs.writeFileSync(concatTxt, clips.map(p => `file '${p}'`).join('\n'));
-  const silent = `${WORK}/silent.mp4`;
-  execSync(`ffmpeg -f concat -safe 0 -i "${concatTxt}" -c copy -y "${silent}"`, { timeout: 120000 });
-  const outDir = path.dirname(output_mp4);
-  if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
-  execSync(`ffmpeg -i "${silent}" -i "${audio_file}" -c:v copy -c:a aac -map 0:v:0 -map 1:a:0 -shortest -y "${output_mp4}"`, { timeout: 300000 });
-  console.log('OUTPUT:' + output_mp4);
+
+  if (FFMPEG) {
+    // System ffmpeg works — use it
+    console.log('Using system ffmpeg:', FFMPEG);
+    const clips = [];
+    for (let i = 0; i < pngs.length; i++) {
+      const idx = String(i).padStart(3,'0');
+      const clip = `${WORK}/clip_${idx}.mp4`;
+      const r = spawnSync(FFMPEG, ['-y','-loop','1','-i',pngs[i],'-t',durations[i].toFixed(2),
+        '-c:v','mpeg4','-pix_fmt','yuv420p','-r','25', clip],
+        { timeout: 60000, encoding: 'utf8' });
+      if (!fs.existsSync(clip) || fs.statSync(clip).size < 100) {
+        throw new Error(`ffmpeg clip failed for slide ${i}: ${(r.stderr||'').slice(0,300)}`);
+      }
+      clips.push(clip);
+      console.log(`Slide ${idx} OK`);
+    }
+    const concatTxt = `${WORK}/concat.txt`;
+    fs.writeFileSync(concatTxt, clips.map(p => `file '${p}'`).join('\n'));
+    const silent = `${WORK}/silent.mp4`;
+    spawnSync(FFMPEG, ['-f','concat','-safe','0','-i',concatTxt,'-c','copy','-y',silent], { timeout: 120000 });
+    const outDir = path.dirname(output_mp4);
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+    spawnSync(FFMPEG, ['-i',silent,'-i',audio_file,'-c:v','copy','-c:a','aac',
+      '-map','0:v:0','-map','1:a:0','-shortest','-y',output_mp4], { timeout: 300000 });
+  } else {
+    // System ffmpeg broken — use @ffmpeg/ffmpeg WASM
+    console.log('System ffmpeg broken, using WASM...');
+    await ensureWasmFfmpeg();
+    const outDir = path.dirname(output_mp4);
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+    await encodeWithWasm(pngs, durations, audio_file, output_mp4);
+  }
+
+  if (!fs.existsSync(output_mp4) || fs.statSync(output_mp4).size < 1000) {
+    throw new Error('Output MP4 not produced: ' + output_mp4);
+  }
+  console.log('OUTPUT:' + output_mp4 + ' size:' + fs.statSync(output_mp4).size);
 }
 
 main().catch(e => { console.error(e.message); process.exit(1); });
